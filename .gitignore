@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+.env
+
+*.pdf
+
+rag_files/vector_store_id.txt
+
+.DS_Store
