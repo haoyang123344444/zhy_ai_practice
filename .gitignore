@@ -1,10 +1,29 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
 
+# Environment
+.venv/
+env/
+venv/
+
+# Secrets
 .env
 
+# OS
+.DS_Store
+
+# PDFs (optional - you already did this)
 *.pdf
 
-rag_files/vector_store_id.txt
+# RAG / Vector DB cache
+vector_store_id.txt
+rag_files/
 
-.DS_Store
+# UV / package managers
+uv.lock
+*.lock
+
+# logs
+*.log
