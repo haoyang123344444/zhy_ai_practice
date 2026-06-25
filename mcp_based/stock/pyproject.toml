@@ -1,0 +1,10 @@
+[project]
+name = "stock-mcp"
+version = "0.1.0"
+description = "Stock price MCP server using yfinance"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.28.0",
+    "yfinance>=0.2.0",
+]

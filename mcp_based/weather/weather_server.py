@@ -3,21 +3,48 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("weather")
 
+CITY_NAME_MAP = {
+    "旧金山": "San Francisco",
+    "纽约": "New York",
+    "洛杉矶": "Los Angeles",
+    "芝加哥": "Chicago",
+    "华盛顿": "Washington",
+    "伦敦": "London",
+    "巴黎": "Paris",
+    "东京": "Tokyo",
+    "首尔": "Seoul",
+    "悉尼": "Sydney",
+    "新加坡": "Singapore",
+    "曼谷": "Bangkok",
+    "迪拜": "Dubai",
+    "多伦多": "Toronto",
+    "柏林": "Berlin",
+    "罗马": "Rome",
+    "马德里": "Madrid",
+    "莫斯科": "Moscow",
+    "孟买": "Mumbai",
+}
+
 # -----------------------------
 # 1. City → Lat/Lon (simple geocoder)
 # -----------------------------
 async def geocode(city: str):
     url = "https://geocoding-api.open-meteo.com/v1/search"
 
+    cities_to_try = [city]
+    if city in CITY_NAME_MAP:
+        cities_to_try.append(CITY_NAME_MAP[city])
+
     async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(url, params={"name": city, "count": 1})
-        data = r.json()
+        for name in cities_to_try:
+            r = await client.get(url, params={"name": name, "count": 1})
+            data = r.json()
 
-    if "results" not in data or not data["results"]:
-        return None
+            if "results" in data and data["results"]:
+                top = data["results"][0]
+                return top["latitude"], top["longitude"], top["name"], top.get("country", "")
 
-    top = data["results"][0]
-    return top["latitude"], top["longitude"], top["name"], top.get("country", "")
+    return None
 
 
 # -----------------------------
