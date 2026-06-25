@@ -2,6 +2,28 @@ import requests
 import yfinance as yf
 
 
+CITY_NAME_MAP = {
+    "旧金山": "San Francisco",
+    "纽约": "New York",
+    "洛杉矶": "Los Angeles",
+    "芝加哥": "Chicago",
+    "华盛顿": "Washington",
+    "伦敦": "London",
+    "巴黎": "Paris",
+    "东京": "Tokyo",
+    "首尔": "Seoul",
+    "悉尼": "Sydney",
+    "新加坡": "Singapore",
+    "曼谷": "Bangkok",
+    "迪拜": "Dubai",
+    "多伦多": "Toronto",
+    "柏林": "Berlin",
+    "罗马": "Rome",
+    "马德里": "Madrid",
+    "莫斯科": "Moscow",
+    "孟买": "Mumbai",
+}
+
 WEATHER_CODES = {
     0: "晴天",
     1: "大致晴朗",
@@ -17,18 +39,25 @@ WEATHER_CODES = {
 
 def geocode_city(city: str):
     url = "https://geocoding-api.open-meteo.com/v1/search"
-    params = {
-        "name": city,
-        "count": 1,
-        "language": "zh",
-        "format": "json",
-    }
 
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
+    cities_to_try = [city]
+    if city in CITY_NAME_MAP:
+        cities_to_try.append(CITY_NAME_MAP[city])
 
-    if "results" not in data or not data["results"]:
+    for name in cities_to_try:
+        params = {
+            "name": name,
+            "count": 1,
+            "language": "zh",
+            "format": "json",
+        }
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        if "results" in data and data["results"]:
+            break
+    else:
         return None
 
     result = data["results"][0]
