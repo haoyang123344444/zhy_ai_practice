@@ -1,5 +1,5 @@
 from mcp.server.fastmcp import FastMCP
-from rag_core import search_pdf
+from rag_core import search_pdf_async
 import sys
 print("PYTHON USED:", sys.executable)
 
@@ -11,7 +11,7 @@ mcp = FastMCP("pdf-rag")
 )
 async def search_pdf_tool(question: str) -> str:
     try:
-        return search_pdf(question)
+        return await search_pdf_async(question)
     except Exception as e:
         return f"PDF RAG error: {str(e)}"
 
