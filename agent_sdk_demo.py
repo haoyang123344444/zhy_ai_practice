@@ -28,6 +28,9 @@ from agents import Agent, Runner, handoff, trace
 from agents.memory.openai_conversations_session import OpenAIConversationsSession
 from agents.mcp.server import MCPServerStdio, MCPServerStdioParams
 
+# LangFuse 追踪（可选，用于和 multi_agent.py 统一查看 trace）
+from tracing import get_langfuse, flush, NOOP
+
 # ============================================================
 # 路径配置（复用你现有的 MCP Server 子进程）
 # ============================================================
@@ -521,6 +524,15 @@ async def main():
     print("对比: multi_agent.py (手写) vs agent_sdk_demo.py (SDK)")
     print("=" * 60)
 
+    # LangFuse trace（如果已配置），包住整个 demo 调用
+    # 注意: SDK 自己的 trace() 记录在 OpenAI dashboard，LangFuse 记录在这里
+    # 如果想统一查看，可以在 LangFuse 中搜索 trace name
+    langfuse = get_langfuse()
+    top_trace = langfuse.trace(
+        name="SDKDemo",
+        input={"patterns": "Pattern 2: Triage + Handoff"},
+    ) if langfuse else NOOP
+
     # ---- Setup: 连接 MCP Server ----
     weather_server, stock_server, web_search_server = make_servers()
 
@@ -558,6 +570,8 @@ async def main():
 
 
     finally:
+        top_trace.end()
+        flush()
         # SDK 的 server.cleanup() 自动关闭子进程和清理连接
         await stack.aclose()
         print("\n[Cleanup] MCP servers disconnected.")

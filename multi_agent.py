@@ -31,6 +31,9 @@ from openai import OpenAI
 # 复用 MCP 连接管理器
 from orchestrator_mcp import MCPHub
 
+# LangFuse 追踪
+from tracing import get_langfuse, flush, NOOP
+
 # ============================================================
 # 配置
 # ============================================================
@@ -132,65 +135,132 @@ class Agent:
         self.tools = openai_tools
         self.hub = hub
 
-    async def run(self, task: str, verbose: bool = True) -> str:
+    async def run(self, task: str, verbose: bool = True, langfuse_trace=None) -> str:
         """
         ReAct 推理循环:
           Thought → Action(调用工具) → Observation → Thought → ... → Final Answer
+
+        langfuse_trace: 可选的 LangFuse trace 对象，传入后自动创建 agent span
+                       以及内部的 LLM generation + tool span
         """
+        trace = langfuse_trace or NOOP
+        agent_span = trace.span(
+            name=f"agent:{self.agent_id}",
+            input={"task": task},
+            metadata={"agent_name": self.name, "model": self.model, "max_steps": self.max_steps},
+        )
+
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": task},
         ]
 
-        for step in range(self.max_steps):
-            response = client.chat.completions.create(
+        try:
+            for step in range(self.max_steps):
+                response = client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    tools=self.tools,
+                    tool_choice="auto",
+                )
+                msg = response.choices[0].message
+
+                # ---- 记录 LLM generation ----
+                gen = agent_span.generation(
+                    name=f"step_{step + 1}_llm",
+                    model=self.model,
+                    input={
+                        "message_count": len(messages),
+                        "last_role": messages[-1]["role"],
+                    },
+                )
+                if response.usage:
+                    gen.update(
+                        output=msg.content or ("[tool_calls: " + ", ".join(
+                            tc.function.name for tc in (msg.tool_calls or [])
+                        ) + "]"),
+                        usage={
+                            "prompt_tokens": response.usage.prompt_tokens,
+                            "completion_tokens": response.usage.completion_tokens,
+                            "total_tokens": response.usage.total_tokens,
+                        },
+                        metadata={"step": step + 1, "has_tool_calls": bool(msg.tool_calls)},
+                    )
+                gen.end()
+
+                # Agent 认为任务完成 → 返回最终回答
+                if not msg.tool_calls:
+                    if verbose:
+                        print(f"  [{self.emoji} {self.name}] OK ({step + 1} step(s))")
+                    agent_span.end(output={"answer": msg.content})
+                    return msg.content or ""
+
+                # Agent 需要调用工具
+                messages.append(msg)
+                if verbose:
+                    names = [tc.function.name for tc in msg.tool_calls]
+                    print(f"  [{self.emoji} {self.name}] step {step + 1}: {names}")
+
+                for tc in msg.tool_calls:
+                    tool_name = tc.function.name
+                    args = json.loads(tc.function.arguments)
+
+                    # ---- 记录工具调用 span ----
+                    tool_span = agent_span.span(
+                        name=f"tool:{tool_name}",
+                        input=args,
+                    )
+
+                    try:
+                        call_mcp = self.hub.get_caller(tool_name)
+                        result = await call_mcp(**args)
+                        tool_span.end(output={"result": result[:500]})
+                    except Exception as e:
+                        tool_span.end(output={"error": str(e)}, level="ERROR")
+                        result = f"Tool error: {e}"
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result,
+                    })
+
+            # 达到 max_steps，强制总结
+            if verbose:
+                print(f"  [{self.emoji} {self.name}] max steps reached, forcing summary")
+
+            messages.append({
+                "role": "user",
+                "content": "请基于已收集的所有信息，给出你的最终分析结论。",
+            })
+            final = client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                tools=self.tools,
-                tool_choice="auto",
             )
-            msg = response.choices[0].message
+            # 记录强制总结的 generation
+            gen = agent_span.generation(
+                name="forced_summary_llm",
+                model=self.model,
+                input={"message_count": len(messages)},
+            )
+            if final.usage:
+                gen.update(
+                    output=final.choices[0].message.content,
+                    usage={
+                        "prompt_tokens": final.usage.prompt_tokens,
+                        "completion_tokens": final.usage.completion_tokens,
+                        "total_tokens": final.usage.total_tokens,
+                    },
+                )
+            gen.end()
 
-            # Agent 认为任务完成 → 返回最终回答
-            if not msg.tool_calls:
-                if verbose:
-                    print(f"  [{self.emoji} {self.name}] OK ({step + 1} step(s))")
-                return msg.content or ""
+            answer = final.choices[0].message.content or ""
+            agent_span.end(output={"answer": answer, "forced_summary": True})
+            return answer
 
-            # Agent 需要调用工具
-            messages.append(msg)
-            if verbose:
-                names = [tc.function.name for tc in msg.tool_calls]
-                print(f"  [{self.emoji} {self.name}] step {step + 1}: {names}")
-
-            for tc in msg.tool_calls:
-                tool_name = tc.function.name
-                args = json.loads(tc.function.arguments)
-                try:
-                    call_mcp = self.hub.get_caller(tool_name)
-                    result = await call_mcp(**args)
-                except Exception as e:
-                    result = f"Tool error: {e}"
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result,
-                })
-
-        # 达到 max_steps，强制总结
-        if verbose:
-            print(f"  [{self.emoji} {self.name}] max steps reached, forcing summary")
-
-        messages.append({
-            "role": "user",
-            "content": "请基于已收集的所有信息，给出你的最终分析结论。",
-        })
-        final = client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-        )
-        return final.choices[0].message.content or ""
+        except Exception as e:
+            agent_span.end(output={"error": str(e)}, level="ERROR")
+            raise
 
 
 
@@ -230,8 +300,10 @@ class MultiAgentOrchestrator:
     def __init__(self, agents: dict[str, Agent]):
         self.agents = agents
 
-    async def _route(self, user_input: str) -> dict[str, str]:
+    async def _route(self, user_input: str, langfuse_trace=None) -> dict[str, str]:
         """Router: 分析用户意图，返回 {agent_id: subtask}"""
+        trace = langfuse_trace or NOOP
+        router_span = trace.span(name="router", input={"user_input": user_input})
 
         agent_list = "\n".join(
             f"- {aid}: {a.name}" for aid, a in self.agents.items()
@@ -248,6 +320,23 @@ class MultiAgentOrchestrator:
         )
         raw = response.choices[0].message.content or "{}"
 
+        # 记录 router LLM generation
+        gen = router_span.generation(
+            name="router_llm",
+            model="gpt-4o-mini",
+            input={"prompt": router_prompt[:1000], "user_input": user_input},
+        )
+        if response.usage:
+            gen.update(
+                output=raw,
+                usage={
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens,
+                },
+            )
+        gen.end()
+
         # 清理可能的 markdown 代码块
         raw = raw.strip()
         if raw.startswith("```"):
@@ -258,9 +347,11 @@ class MultiAgentOrchestrator:
             plan = json.loads(raw)
         except json.JSONDecodeError:
             print(f"  [Router] JSON parse failed, fallback: all agents")
-            return {aid: user_input for aid in self.agents}
+            plan = {"tasks": {aid: user_input for aid in self.agents}}
 
-        return plan.get("tasks", {})
+        tasks = plan.get("tasks", {})
+        router_span.end(output={"activated_agents": list(tasks.keys()), "tasks": tasks})
+        return tasks
 
 
 
@@ -271,13 +362,22 @@ class MultiAgentOrchestrator:
             print(f"\n{'─' * 50}")
             print(f"[User] {user_input}")
 
+        # 创建 LangFuse trace（如果已配置）
+        langfuse = get_langfuse()
+        print("LangFuse:", langfuse)
+        trace = langfuse.trace(
+            name=f"MultiAgent: {user_input[:80]}",
+            input={"user_input": user_input},
+            metadata={"available_agents": list(self.agents.keys())},
+        ) if langfuse else NOOP
+
         # ---- 1. Route: 分析意图，分配子任务 ----
         if verbose:
             print(f"\n[Router] analyzing intent...")
-        tasks = await self._route(user_input)
-
+        tasks = await self._route(user_input, langfuse_trace=trace)
 
         if not tasks:
+            trace.update(output={"error": "no agents matched"})
             return "抱歉，我无法判断该问题需要哪些专家来处理。"
 
         if verbose:
@@ -294,7 +394,7 @@ class MultiAgentOrchestrator:
             if agent is None:
                 return aid, f"Agent '{aid}' not found"
             try:
-                result = await agent.run(task, verbose=verbose)
+                result = await agent.run(task, verbose=verbose, langfuse_trace=trace)
                 return aid, result
             except Exception as e:
                 return aid, f"Agent error: {e}"
@@ -319,11 +419,14 @@ class MultiAgentOrchestrator:
                 valid[aid] = result
 
         if not valid:
+            trace.update(output={"error": "all agents skipped"})
             return "所有专家都认为此问题不在其专业领域内，请尝试换一种问法。"
 
         # 只有一个 agent 有结果 → 直接返回
         if len(valid) == 1:
-            return list(valid.values())[0]
+            answer = list(valid.values())[0]
+            trace.update(output={"answer": answer, "aggregation": "single_agent"})
+            return answer
 
         # 多个 agent → LLM 汇总
         results_text = "\n\n---\n\n".join(
@@ -335,11 +438,31 @@ class MultiAgentOrchestrator:
             agent_results=results_text,
         )
 
+        # ---- 记录 Aggregator span + generation ----
+        agg_span = trace.span(name="aggregator", input={"agent_count": len(valid)})
         final = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": agg_prompt}],
         )
-        return final.choices[0].message.content or ""
+        agg_gen = agg_span.generation(
+            name="aggregator_llm",
+            model="gpt-4o-mini",
+            input={"prompt": agg_prompt[:1000]},
+        )
+        if final.usage:
+            agg_gen.update(
+                output=final.choices[0].message.content,
+                usage={
+                    "prompt_tokens": final.usage.prompt_tokens,
+                    "completion_tokens": final.usage.completion_tokens,
+                    "total_tokens": final.usage.total_tokens,
+                },
+            )
+        agg_gen.end()
+        answer = final.choices[0].message.content or ""
+        agg_span.end(output={"answer": answer})
+        trace.update(output={"answer": answer, "aggregation": "multi_agent_llm"})
+        return answer
 
 
 # ============================================================
@@ -408,6 +531,7 @@ async def main():
 
     finally:
         await hub.close()
+        flush()
         print("\nBye!")
 
 
