@@ -2,23 +2,30 @@
 Multi-Agent System — Hand-written from scratch
 
 架构:
-  ┌──────────────────────────────────────┐
-  │   MultiAgentOrchestrator              │
-  │   1. Router: 分析意图 → 选择Agent       │
-  │   2. Dispatcher: 并行分配子任务         │
-  │   3. Aggregator: 汇总各Agent结果        │
-  └──────┬──────────┬────────────────────┘
-         │          │
-    ┌────▼───┐  ┌───▼────┐  ┌──────────┐
-    │Weather │  │ Stock  │  │ PDF RAG  │
-    │ Agent  │  │ Agent  │  │  Agent   │
-    └────────┘  └────────┘  └──────────┘
+  ┌──────────────────────────────────────────────────┐
+  │   MultiAgentOrchestrator                          │
+  │   1. Router: 分析意图 → 选择Agent                   │
+  │   2. Dispatcher: 并行分配子任务                     │
+  │   3. Aggregator: 汇总各Agent结果                    │
+  │   4. AgentBus: Agent 间委派（delegate_task）        │
+  └──────┬──────────┬──────────┬────────────────────┘
+         │          │          │
+    ┌────▼───┐  ┌───▼────┐  ┌──▼──────┐
+    │Weather │◄─┤delegate├─►│ Stock   │
+    │ Agent  │  │  task   │  │  Agent  │
+    └────────┘  └────────┘  └─────────┘
 
-每个 Agent = 专家 system prompt + 专属 MCP 工具 + 独立 ReAct 推理循环
+每个 Agent = 专家 system prompt + 专属 MCP 工具 + delegate_task + 独立 ReAct 推理循环
+
+Agent 间通信:
+  - Agent 可以在 ReAct 循环中调用 delegate_task 委派子任务给其他 Agent
+  - 委派链深度限制 MAX_DELEGATION_DEPTH=3，循环委派会被拦截
+  - 委派结果作为 tool result 返回给委派方，委派方负责整合到最终回答
 
 和 orchestrator_mcp.py 的区别:
   - orchestrator_mcp: 单 LLM → 并行调用工具 → 汇总（工具没有推理能力）
   - multi_agent: Router → 选择 Agent → 每个 Agent 独立多步推理 → 汇总
+    且 Agent 之间可以互相委派子任务
 """
 
 import asyncio
@@ -33,6 +40,9 @@ from orchestrator_mcp import MCPHub
 
 # LangFuse 追踪
 from tracing import get_langfuse, flush, NOOP
+
+# Human-in-the-Loop
+from hitl import HITLManager, HITLDecision, HITLMode
 
 # ============================================================
 # 配置
@@ -74,7 +84,9 @@ AGENT_DEFS = {
 注意:
   - 如果用户提到多个城市，逐一查询
   - 给出实用建议（如是否需要带伞、适合什么户外活动等）
-  - 如果任务跟天气完全无关，回复 "SKIP: 此任务不在我的专业领域内"
+  - 如果任务涉及股票/金融等其他领域，使用 delegate_task 委派给对应专家
+  - 只有完全无法处理且无法委派时，才回复 "SKIP: 此任务不在我的专业领域内"
+  - 委派得到的结果要整合进你的最终回答
   - 回答简洁专业，用中文""",
     },
     "stock": {
@@ -95,7 +107,9 @@ AGENT_DEFS = {
   - 如果用户提到多个股票，逐一查询
   - 结合公司基本面和历史数据给出更全面的分析
   - 不要给出具体的买卖投资建议，只提供数据和分析
-  - 如果任务跟股票完全无关，回复 "SKIP: 此任务不在我的专业领域内"
+  - 如果任务涉及天气等其他领域，使用 delegate_task 委派给对应专家
+  - 只有完全无法处理且无法委派时，才回复 "SKIP: 此任务不在我的专业领域内"
+  - 委派得到的结果要整合进你的最终回答
   - 回答简洁专业，用中文""",
     },
     # 可选: 启用 pdf_rag agent
@@ -114,10 +128,62 @@ AGENT_DEFS = {
 }
 
 # ============================================================
+# Agent 委派工具 — 让 Agent 之间可以互相求助
+# ============================================================
+def make_delegate_tool(agent_registry: dict[str, dict], self_id: str) -> dict | None:
+    """为某个 agent 生成 delegate_task 工具 schema。
+
+    列出除了自己以外的所有可用 agent，LLM 可以选择委派给谁。
+    如果只有自己一个 agent，返回 None（不需要委派工具）。
+    """
+    others = {
+        aid: info for aid, info in agent_registry.items() if aid != self_id
+    }
+    if not others:
+        return None
+
+    descriptions = "\n".join(
+        f"  - {aid}: {info['name']}"
+        for aid, info in others.items()
+    )
+    return {
+        "type": "function",
+        "function": {
+            "name": "delegate_task",
+            "description": (
+                f"将子任务委派给其他专家 agent。"
+                f"当你需要其他领域的专业分析时调用此工具。"
+                f"\n\n可委派的 agent:\n{descriptions}"
+                f"\n\n委派后你会收到目标 agent 的分析结果，"
+                f"请将其整合到你的最终回答中。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "enum": list(others.keys()),
+                        "description": "目标 agent 的 ID",
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "委派给目标 agent 的具体子任务，要清晰明确，用中文",
+                    },
+                },
+                "required": ["agent_id", "task"],
+            },
+        },
+    }
+
+
+# ============================================================
 # Agent — 独立 ReAct 推理循环
 # ============================================================
+MAX_DELEGATION_DEPTH = 3  # 最大委派深度，防止无限委派
+
+
 class Agent:
-    """一个有独立推理能力的 Agent"""
+    """一个有独立推理能力的 Agent，支持向其他 Agent 委派子任务"""
 
     def __init__(
         self,
@@ -125,6 +191,9 @@ class Agent:
         config: dict,
         hub: MCPHub,
         openai_tools: list[dict],
+        hitl_manager: HITLManager | None = None,
+        delegate_tool: dict | None = None,
+        agents_info: dict[str, dict] | None = None,
     ):
         self.agent_id = agent_id
         self.name = config["name"]
@@ -132,22 +201,43 @@ class Agent:
         self.system_prompt = config["system_prompt"]
         self.model = config.get("model", "gpt-4o-mini")
         self.max_steps = config.get("max_steps", 5)
-        self.tools = openai_tools
+        self.tools = list(openai_tools)
+        if delegate_tool:
+            self.tools.append(delegate_tool)
+        self._has_delegate = delegate_tool is not None
         self.hub = hub
+        self.hitl = hitl_manager or HITLManager()
+        self.agents_info = agents_info or {}
 
-    async def run(self, task: str, verbose: bool = True, langfuse_trace=None) -> str:
+    async def run(
+        self,
+        task: str,
+        verbose: bool = True,
+        langfuse_trace=None,
+        delegate_handler=None,
+        delegation_depth: int = 0,
+        delegation_chain: tuple[str, ...] = (),
+    ) -> str:
         """
         ReAct 推理循环:
           Thought → Action(调用工具) → Observation → Thought → ... → Final Answer
 
-        langfuse_trace: 可选的 LangFuse trace 对象，传入后自动创建 agent span
-                       以及内部的 LLM generation + tool span
+        langfuse_trace: 可选的 LangFuse trace 对象
+        delegate_handler: async (target_id, task) -> str，用于处理委派
+        delegation_depth: 当前委派深度，顶层调用为 0
+        delegation_chain: 委派链上的 agent ID 序列，用于防循环
         """
         trace = langfuse_trace or NOOP
         agent_span = trace.span(
             name=f"agent:{self.agent_id}",
             input={"task": task},
-            metadata={"agent_name": self.name, "model": self.model, "max_steps": self.max_steps},
+            metadata={
+                "agent_name": self.name,
+                "model": self.model,
+                "max_steps": self.max_steps,
+                "delegation_depth": delegation_depth,
+                "delegation_chain": list(delegation_chain),
+            },
         )
 
         messages = [
@@ -204,6 +294,64 @@ class Agent:
                 for tc in msg.tool_calls:
                     tool_name = tc.function.name
                     args = json.loads(tc.function.arguments)
+
+                    # ---- 处理 Agent 委派 ----
+                    if tool_name == "delegate_task":
+                        target_id = args.get("agent_id", "")
+                        subtask = args.get("task", "")
+
+                        if verbose:
+                            target_name = self.agents_info.get(target_id, {}).get("name", target_id) if hasattr(self, "agents_info") else target_id
+                            print(f"  [{self.emoji} {self.name}] → delegates to [{target_id}] \"{subtask[:60]}...\"")
+
+                        if delegate_handler is None:
+                            result = "Error: 委派功能不可用（没有可用的其他 agent）"
+                        elif delegation_depth >= MAX_DELEGATION_DEPTH:
+                            result = "Error: 已达到最大委派深度，请用已有信息给出回答"
+                        elif target_id in delegation_chain:
+                            result = f"Error: Agent '{target_id}' 已在委派链中（{delegation_chain}），不能循环委派"
+                        else:
+                            try:
+                                result = await delegate_handler(
+                                    from_agent_id=self.agent_id,
+                                    target_id=target_id,
+                                    task=subtask,
+                                    depth=delegation_depth + 1,
+                                    chain=delegation_chain + (self.agent_id,),
+                                )
+                            except Exception as e:
+                                result = f"委派失败: {e}"
+
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result,
+                        })
+                        continue
+
+                    # ---- HITL: 工具调用审批 ----
+                    decision = await self.hitl.approve_tool_call(
+                        agent_id=self.agent_id,
+                        agent_name=self.name,
+                        tool_name=tool_name,
+                        args=args,
+                    )
+                    if decision == HITLDecision.REJECT:
+                        result = "Tool call rejected by user."
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result,
+                        })
+                        continue
+                    elif decision == HITLDecision.SKIP:
+                        result = "[User chose to skip this tool call. Continue without this data.]"
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result,
+                        })
+                        continue
 
                     # ---- 记录工具调用 span ----
                     tool_span = agent_span.span(
@@ -297,8 +445,44 @@ AGGREGATOR_PROMPT = """\
 
 
 class MultiAgentOrchestrator:
-    def __init__(self, agents: dict[str, Agent]):
+    def __init__(self, agents: dict[str, Agent], hitl_manager: HITLManager | None = None):
         self.agents = agents
+        self.hitl = hitl_manager or HITLManager()
+        self._current_trace = NOOP  # 当前运行 trace，委派时传递
+
+    async def _handle_delegation(
+        self,
+        from_agent_id: str,
+        target_id: str,
+        task: str,
+        depth: int,
+        chain: tuple[str, ...],
+    ) -> str:
+        """处理 Agent 委派：运行目标 agent 并返回其结果。
+
+        目标和深度检查已在 Agent.run() 中完成，这里只负责执行。
+        """
+        target = self.agents.get(target_id)
+        if target is None:
+            return f"Error: Agent '{target_id}' 不存在，可用: {list(self.agents.keys())}"
+        return await target.run(
+            task=task,
+            verbose=True,
+            langfuse_trace=self._current_trace,
+            delegate_handler=self._make_delegate_handler(),
+            delegation_depth=depth,
+            delegation_chain=chain,
+        )
+
+    def _make_delegate_handler(self):
+        """创建一个委派处理器闭包，捕获当前 orchestrator 的 agents 引用。"""
+        orch = self
+
+        async def handler(from_agent_id: str, target_id: str, task: str,
+                          depth: int, chain: tuple[str, ...]) -> str:
+            return await orch._handle_delegation(from_agent_id, target_id, task, depth, chain)
+
+        return handler
 
     async def _route(self, user_input: str, langfuse_trace=None) -> dict[str, str]:
         """Router: 分析用户意图，返回 {agent_id: subtask}"""
@@ -358,6 +542,8 @@ class MultiAgentOrchestrator:
     async def run(self, user_input: str, verbose: bool = True) -> str:
         """完整的 multi-agent 流程: route → dispatch → aggregate"""
 
+        self.hitl.reset()
+
         if verbose:
             print(f"\n{'─' * 50}")
             print(f"[User] {user_input}")
@@ -370,6 +556,7 @@ class MultiAgentOrchestrator:
             input={"user_input": user_input},
             metadata={"available_agents": list(self.agents.keys())},
         ) if langfuse else NOOP
+        self._current_trace = trace
 
         # ---- 1. Route: 分析意图，分配子任务 ----
         if verbose:
@@ -379,6 +566,12 @@ class MultiAgentOrchestrator:
         if not tasks:
             trace.update(output={"error": "no agents matched"})
             return "抱歉，我无法判断该问题需要哪些专家来处理。"
+
+        # ---- HITL: Router 确认 ----
+        tasks = await self.hitl.confirm_router_plan(tasks, self.agents)
+        if not tasks:
+            trace.update(output={"error": "user cancelled router plan"})
+            return "已取消。"
 
         if verbose:
             print(f"[Router] activated: {', '.join(tasks.keys())}")
@@ -394,7 +587,12 @@ class MultiAgentOrchestrator:
             if agent is None:
                 return aid, f"Agent '{aid}' not found"
             try:
-                result = await agent.run(task, verbose=verbose, langfuse_trace=trace)
+                result = await agent.run(
+                    task,
+                    verbose=verbose,
+                    langfuse_trace=trace,
+                    delegate_handler=self._make_delegate_handler(),
+                )
                 return aid, result
             except Exception as e:
                 return aid, f"Agent error: {e}"
@@ -471,16 +669,34 @@ class MultiAgentOrchestrator:
 async def main():
     hub = MCPHub()
 
+    # ---- HITL 模式选择 ----
     print("=" * 50)
-    print("Multi-Agent System")
+    print("Multi-Agent System (with Human-in-the-Loop)")
     print("=" * 50)
+    print("\nHITL 模式:")
+    print("  1. OFF    — 全自动执行（默认）")
+    print("  2. ROUTER — 确认 Router 的 Agent 派发计划")
+    print("  3. TOOLS  — 审批每个工具调用")
+    print("  4. FULL   — Router + Tools 都需确认")
+
+    mode_map = {
+        "1": HITLMode.OFF, "": HITLMode.OFF,
+        "2": HITLMode.ROUTER_ONLY,
+        "3": HITLMode.TOOLS_ONLY,
+        "4": HITLMode.FULL,
+    }
+    mode_input = input("\n选择模式 [1]: ").strip()
+    print(f"DEBUG: repr={mode_input!r}")  # 加这行看真实输入了什么
+    hitl_mode = mode_map.get(mode_input, HITLMode.OFF)
+    hitl = HITLManager(mode=hitl_mode)
+    print(f"HITL: {hitl_mode.value}\n")
 
     # 1. 连接所有 MCP Server
-    print("\nConnecting to MCP servers...")
+    print("Connecting to MCP servers...")
     all_tools = await hub.connect_all(MCP_SERVERS)
     print(f"Total MCP tools discovered: {len(all_tools)}")
 
-    # 2. 为每个 Agent 装配专属工具
+    # 2. 为每个 Agent 装配专属工具 + 委派工具（共享同一个 HITLManager）
     agents: dict[str, Agent] = {}
     for aid, config in AGENT_DEFS.items():
         tool_names = set(config["tools"])
@@ -493,8 +709,16 @@ async def main():
             print(f"  SKIP {aid}: required MCP server not connected")
             continue
 
-        agents[aid] = Agent(aid, config, hub, agent_tools)
+        delegate_tool = make_delegate_tool(AGENT_DEFS, aid)
+        agents[aid] = Agent(
+            aid, config, hub, agent_tools,
+            hitl_manager=hitl,
+            delegate_tool=delegate_tool,
+            agents_info={k: {"name": v["name"]} for k, v in AGENT_DEFS.items()},
+        )
         tool_list = ", ".join(t["function"]["name"] for t in agent_tools)
+        if delegate_tool:
+            tool_list += " + delegate_task"
         print(f"  {config['emoji']} {config['name']}: {tool_list}")
 
     if not agents:
@@ -502,17 +726,18 @@ async def main():
         await hub.close()
         return
 
-    # 3. 创建 Orchestrator
-    orch = MultiAgentOrchestrator(agents)
+    # 3. 创建 Orchestrator（共享同一个 HITLManager）
+    orch = MultiAgentOrchestrator(agents, hitl_manager=hitl)
 
     print(f"\n{'=' * 50}")
     print(f"Ready! {len(agents)} agents standing by.")
     print(f"")
-    print(f"Try:")
+    print(f"Multi-domain queries (Router dispatches to multiple agents):")
     print(f"  '查 TSLA 股价和旧金山天气'")
-    print(f"  '分析 AAPL 最近走势，结合公司基本面'")
     print(f"  '旧金山今天适合户外运动吗'")
-    print(f"  '对比一下 NVDA 和 AMD'")
+    print(f"Single-domain with delegation (agent delegates to another):")
+    print(f"  'TSLA 股价怎么样？另外帮我查一下纽约天气'")
+    print(f"  '旧金山天气如何？这对 AAPL 股价有什么影响'")
     print(f"Type 'quit' to exit")
     print(f"{'=' * 50}")
 
