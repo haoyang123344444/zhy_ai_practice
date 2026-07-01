@@ -3,11 +3,14 @@ Multi-Agent System — Hand-written from scratch
 
 架构:
   ┌──────────────────────────────────────────────────┐
-  │   MultiAgentOrchestrator                          │
+  │   MultiAgentOrchestrator (+ Memory)                │
+  │   0. Memory: 注入短/长期记忆到上下文                  │
   │   1. Router: 分析意图 → 选择Agent                   │
   │   2. Dispatcher: 并行分配子任务                     │
   │   3. Aggregator: 汇总各Agent结果                    │
-  │   4. AgentBus: Agent 间委派（delegate_task）        │
+  │   4. Reflector: 质检 + 修正（完整性/准确性/一致性）   │
+  │   5. Memory: 提取关键信息 → 存入长期记忆              │
+  │   6. AgentBus: Agent 间委派（delegate_task）        │
   └──────┬──────────┬──────────┬────────────────────┘
          │          │          │
     ┌────▼───┐  ┌───▼────┐  ┌──▼──────┐
@@ -43,6 +46,9 @@ from tracing import get_langfuse, flush, NOOP
 
 # Human-in-the-Loop
 from hitl import HITLManager, HITLDecision, HITLMode
+
+# Memory 系统
+from memory_lib import ConversationMemory, LongTermMemory
 
 # ============================================================
 # 配置
@@ -443,12 +449,46 @@ AGGREGATOR_PROMPT = """\
 - 不编造数据，只使用专家提供的实际信息
 - 用中文回答，简洁有条理"""
 
+REFLECTOR_PROMPT = """\
+你是一个严格的质量审查员。你需要审查以下 AI 助手的回答是否合格。
+
+用户原始问题:
+{user_input}
+
+各专家原始分析结果:
+{agent_results}
+
+AI 助手的整合回答:
+{aggregated_answer}
+
+请从以下三个维度审查:
+
+1. **完整性** — 用户提出的每个子问题都被回答了吗？有没有遗漏？
+2. **准确性** — 整合回答中的所有数据（数字、日期、名称等）是否和专家原始结果一致？有没有编造或修改数据？
+3. **一致性** — 如果多个专家提供了相关信息，它们之间是否有矛盾？如有矛盾，是否被妥善处理？
+
+判断规则:
+- 如果回答完全合格（无遗漏、无编造、无矛盾），直接原样输出该回答，不要加任何修改或前缀。
+- 如果回答有小问题（遗漏了某个子问题、某个数据不准确、表述不够清晰），请在原回答基础上修正，输出修正后的完整回答。不要输出你的审查过程，只输出修正后的回答。
+- 如果回答有严重问题（大量编造数据、完全未回答用户问题），请基于专家原始结果重新生成一个正确的回答。
+
+重要: 你的输出就是最终给用户的回答。不要加"审查结果："、"修正后："等前缀，直接输出最终答案。用中文。"""
+
+
 
 class MultiAgentOrchestrator:
-    def __init__(self, agents: dict[str, Agent], hitl_manager: HITLManager | None = None):
+    def __init__(
+        self,
+        agents: dict[str, Agent],
+        hitl_manager: HITLManager | None = None,
+        conv_memory: ConversationMemory | None = None,
+        long_memory: LongTermMemory | None = None,
+    ):
         self.agents = agents
         self.hitl = hitl_manager or HITLManager()
-        self._current_trace = NOOP  # 当前运行 trace，委派时传递
+        self.conv_memory = conv_memory or ConversationMemory()
+        self.long_memory = long_memory
+        self._current_trace = NOOP
 
     async def _handle_delegation(
         self,
@@ -483,6 +523,34 @@ class MultiAgentOrchestrator:
             return await orch._handle_delegation(from_agent_id, target_id, task, depth, chain)
 
         return handler
+
+    def _build_memory_context(self, user_input: str) -> str:
+        """将短/长期记忆注入用户输入，让 Router 获得更完整的上下文"""
+        parts = []
+
+        # 长期记忆
+        if self.long_memory is not None and self.long_memory.count > 0:
+            relevant = self.long_memory.search(user_input, top_k=3)
+            if relevant:
+                parts.append("## 相关长期记忆:\n" + "\n".join(f"- {m}" for m in relevant))
+
+        # 短期对话历史
+        if not self.conv_memory.is_empty():
+            parts.append(self.conv_memory.get_context())
+
+        if not parts:
+            return user_input
+
+        # 记忆在前，用户输入在后
+        parts.append(f"## 用户当前问题:\n{user_input}")
+        return "\n\n".join(parts)
+
+    async def _save_memories(self, user_input: str, answer: str):
+        """提取关键信息到长期记忆（后台），并保存到短期对话历史"""
+        self.conv_memory.add_turn(user_input, answer)
+        if self.long_memory is not None:
+            # 后台提取，不阻塞用户看到回答
+            asyncio.create_task(self.long_memory.extract_and_save(user_input, answer))
 
     async def _route(self, user_input: str, langfuse_trace=None) -> dict[str, str]:
         """Router: 分析用户意图，返回 {agent_id: subtask}"""
@@ -539,21 +607,78 @@ class MultiAgentOrchestrator:
 
 
 
+    async def _reflect(
+        self,
+        user_input: str,
+        aggregated_answer: str,
+        agent_results: dict[str, str],
+        langfuse_trace=None,
+    ) -> str:
+        """Reflector: 审查 Aggregator 输出是否合格，不合格则修正"""
+        trace = langfuse_trace or NOOP
+        refl_span = trace.span(name="reflector", input={"answer_length": len(aggregated_answer)})
+
+        results_text = "\n\n---\n\n".join(
+            f"### {self.agents[aid].name}:\n{text}"
+            for aid, text in agent_results.items()
+        )
+        refl_prompt = REFLECTOR_PROMPT.format(
+            user_input=user_input,
+            agent_results=results_text,
+            aggregated_answer=aggregated_answer,
+        )
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": refl_prompt}],
+            temperature=0.1,
+        )
+
+        refl_gen = refl_span.generation(
+            name="reflector_llm",
+            model="gpt-4o-mini",
+            input={"prompt": refl_prompt[:1000]},
+        )
+        if response.usage:
+            refl_gen.update(
+                output=response.choices[0].message.content,
+                usage={
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens,
+                },
+            )
+        refl_gen.end()
+
+        refined = response.choices[0].message.content or aggregated_answer
+        refl_span.end(output={"refined_answer": refined})
+
+        # 如果修正后的答案和原答案不同，打日志
+        if refined.strip() != aggregated_answer.strip():
+            print(f"  [Reflector] answer refined (changed)")
+
+        return refined
+
     async def run(self, user_input: str, verbose: bool = True) -> str:
-        """完整的 multi-agent 流程: route → dispatch → aggregate"""
+        """完整的 multi-agent 流程: memory → route → dispatch → aggregate → reflect → memory"""
 
         self.hitl.reset()
 
+        # ---- 0. Memory: 注入上下文 ----
+        enhanced_input = self._build_memory_context(user_input)
         if verbose:
             print(f"\n{'─' * 50}")
             print(f"[User] {user_input}")
+            if self.long_memory and self.long_memory.count > 0:
+                print(f"[Memory] {self.long_memory.count} long-term, "
+                      f"{len(self.conv_memory.history) // 2} conversation turns")
 
         # 创建 LangFuse trace（如果已配置）
         langfuse = get_langfuse()
         print("LangFuse:", langfuse)
         trace = langfuse.trace(
             name=f"MultiAgent: {user_input[:80]}",
-            input={"user_input": user_input},
+            input={"user_input": user_input, "enhanced_input": enhanced_input},
             metadata={"available_agents": list(self.agents.keys())},
         ) if langfuse else NOOP
         self._current_trace = trace
@@ -561,7 +686,7 @@ class MultiAgentOrchestrator:
         # ---- 1. Route: 分析意图，分配子任务 ----
         if verbose:
             print(f"\n[Router] analyzing intent...")
-        tasks = await self._route(user_input, langfuse_trace=trace)
+        tasks = await self._route(enhanced_input, langfuse_trace=trace)
 
         if not tasks:
             trace.update(output={"error": "no agents matched"})
@@ -620,11 +745,16 @@ class MultiAgentOrchestrator:
             trace.update(output={"error": "all agents skipped"})
             return "所有专家都认为此问题不在其专业领域内，请尝试换一种问法。"
 
-        # 只有一个 agent 有结果 → 直接返回
+        # 只有一个 agent 有结果 → 也走 Reflection 质检
         if len(valid) == 1:
             answer = list(valid.values())[0]
-            trace.update(output={"answer": answer, "aggregation": "single_agent"})
-            return answer
+            if verbose:
+                print(f"\n[Reflector] reviewing single-agent answer...")
+            refined = await self._reflect(user_input, answer, valid, langfuse_trace=trace)
+            trace.update(output={"answer": refined, "aggregation": "single_agent_reflected"})
+            # ---- Memory: 保存 ----
+            await self._save_memories(user_input, refined)
+            return refined
 
         # 多个 agent → LLM 汇总
         results_text = "\n\n---\n\n".join(
@@ -659,8 +789,15 @@ class MultiAgentOrchestrator:
         agg_gen.end()
         answer = final.choices[0].message.content or ""
         agg_span.end(output={"answer": answer})
-        trace.update(output={"answer": answer, "aggregation": "multi_agent_llm"})
-        return answer
+
+        # ---- 4. Reflect: 质检 + 修正 ----
+        if verbose:
+            print(f"\n[Reflector] reviewing aggregated answer...")
+        refined = await self._reflect(user_input, answer, valid, langfuse_trace=trace)
+        trace.update(output={"answer": refined, "aggregation": "multi_agent_reflected"})
+        # ---- Memory: 保存 ----
+        await self._save_memories(user_input, refined)
+        return refined
 
 
 # ============================================================
@@ -671,7 +808,7 @@ async def main():
 
     # ---- HITL 模式选择 ----
     print("=" * 50)
-    print("Multi-Agent System (with Human-in-the-Loop)")
+    print("Multi-Agent System (with Memory & Human-in-the-Loop)")
     print("=" * 50)
     print("\nHITL 模式:")
     print("  1. OFF    — 全自动执行（默认）")
@@ -690,6 +827,12 @@ async def main():
     hitl_mode = mode_map.get(mode_input, HITLMode.OFF)
     hitl = HITLManager(mode=hitl_mode)
     print(f"HITL: {hitl_mode.value}\n")
+
+    # 0. 初始化 Memory
+    conv_memory = ConversationMemory(max_turns=10)
+    memory_store_path = BASE_DIR / "agent_memories.json"
+    long_memory = LongTermMemory(store_path=memory_store_path, client=client)
+    print(f"\nMemory: {long_memory.count} long-term memories loaded from {memory_store_path.name}")
 
     # 1. 连接所有 MCP Server
     print("Connecting to MCP servers...")
@@ -726,8 +869,13 @@ async def main():
         await hub.close()
         return
 
-    # 3. 创建 Orchestrator（共享同一个 HITLManager）
-    orch = MultiAgentOrchestrator(agents, hitl_manager=hitl)
+    # 3. 创建 Orchestrator（共享 HITLManager + Memory）
+    orch = MultiAgentOrchestrator(
+        agents,
+        hitl_manager=hitl,
+        conv_memory=conv_memory,
+        long_memory=long_memory,
+    )
 
     print(f"\n{'=' * 50}")
     print(f"Ready! {len(agents)} agents standing by.")

@@ -27,3 +27,6 @@ uv.lock
 
 # logs
 *.log
+
+# Agent memory (user data)
+agent_memories.json
